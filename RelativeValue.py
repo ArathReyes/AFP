@@ -13,10 +13,16 @@ from Dates import from_excel_date, bump_date
 from PCA import yield_curve_decomposition
 from Stats import analyze_stationarity
 
+import os
+import sys
+
+PATH = os.path.dirname(os.getcwd())
+sys.path.append(PATH)
+
 class RelativeValue:
 
     def __init__(self, country: str , lookback: str = '5Y', base_date: dt.date = dt.date(2026, 1, 1)):
-        with open('config.json') as f:
+        with open(PATH + '/config.json') as f:
             config = json.load(f)[country]
         self.country = country
         self.lookback = lookback
@@ -32,7 +38,7 @@ class RelativeValue:
         self.vt = config["Volatility Target"]
         self.cap = config["Cap"]
         file = 'FX Forwards' if 'fx' in country.lower() else 'Rates'
-        self.rates = pd.read_excel(f'data/{file}.xlsx', index_col=0, sheet_name=config["Curve Name"])[self.tenors]
+        self.rates = pd.read_excel(PATH +f'/data/{file}.xlsx', index_col=0, sheet_name=config["Curve Name"])[self.tenors]
         self.rates.index.rename('Date', inplace=True)
         self.rates.drop('Ticker',inplace=True)
         if 'fx' not in country.lower():
@@ -323,8 +329,8 @@ class RelativeValue:
         fig.update_xaxes(title_text="Confidence", row=3, col=1)
         fig.update_yaxes(title_text="Buffer", row=3, col=1)
         
-        fig.update_xaxes(title_text="Confidence", row=4, col=1)
-        fig.update_yaxes(title_text="Buffer", row=4, col=1)
+        fig.update_xaxes(title_text="Window", row=4, col=1)
+        fig.update_yaxes(title_text="Window", row=4, col=1)
 
         fig.update_xaxes(title_text="Theoretical Quantiles (Normal)", row=5, col=1)
         fig.update_yaxes(title_text="Sample Quantiles (Standardized)", row=5, col=1)
@@ -412,6 +418,9 @@ class RelativeValue:
         lagged_sharpes = self.stress_signal_persistance()
 
         RelativeValue.plot_dashboard_full(self.residuals, lagged_sharpes, rebalancing_sharpes, window_sharpes).write_html(f"{self.country}_stress_test.html")
+        self.rebalancing_sharpes = rebalancing_sharpes 
+        self.windows_sharpes = window_sharpes
+        self.lagged_sharpes = lagged_sharpes
         print("="*100)
 
 
