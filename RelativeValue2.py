@@ -16,13 +16,15 @@ from Stats import analyze_stationarity
 import os
 import sys
 
-PATH = os.path.dirname(os.getcwd())
-sys.path.append(PATH)
+# Always resolve relative to this file's location, regardless of cwd
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(_HERE)
 
 class RelativeValue:
 
     def __init__(self, country: str , lookback: str = '5Y', base_date: dt.date = dt.date(2026, 1, 1)):
-        with open(PATH + '/config.json') as f:
+        _config_path = os.path.join(_HERE, 'config.json')
+        with open(_config_path) as f:
             config = json.load(f)[country]
         self.country = country
         self.lookback = lookback
@@ -38,12 +40,27 @@ class RelativeValue:
         self.vt = config["Volatility Target"]
         self.cap = config["Cap"]
         file = 'FX Forwards' if 'fx' in country.lower() else 'Rates'
-        self.rates = pd.read_excel(f'data/{file}.xlsx', index_col=0, sheet_name=config["Curve Name"])[self.tenors]
+        self.rates = pd.read_excel(os.path.join(_HERE, 'data', f'{file}.xlsx'), index_col=0, sheet_name=config["Curve Name"])[self.tenors]
         self.rates.index.rename('Date', inplace=True)
-        self.rates.drop('Ticker',inplace=True)
-        if 'fx' not in country.lower():
-            self.rates.index = self.rates.index.map(from_excel_date) 
-        self.rates.index = [d.date() for d in self.rates.index]
+        # Drop any rows whose index label is a plain string (e.g. 'Ticker' header
+        # rows that some Excel sheets embed in the data). Works regardless of whether
+        # pandas parsed dates automatically or left them as raw values.
+        string_mask = self.rates.index.map(lambda x: isinstance(x, str))
+        self.rates = self.rates[~string_mask]
+        # Normalise every index entry to a plain datetime.date, handling three
+        # possible types that pd.read_excel may return depending on the sheet:
+        #   (a) datetime.datetime  – pandas auto-parsed the date column
+        #   (b) int / float        – raw Excel serial number
+        #   (c) datetime.date      – already a date (edge case)
+        def _to_date(val):
+            if isinstance(val, dt.datetime):
+                return val.date()
+            if isinstance(val, dt.date):
+                return val
+            if isinstance(val, (int, float)):
+                return from_excel_date(val).date()
+            return pd.to_datetime(val).date()
+        self.rates.index = [_to_date(d) for d in self.rates.index]
         self.rates.dropna(inplace=True)
         if 'fx' not in country.lower():
             self.rates /= 100
