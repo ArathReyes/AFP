@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, Any, Optional, List
 import os
+import re
 from datetime import datetime
 
 from base_model import BaseTimeSeriesModel
@@ -20,16 +21,16 @@ from cnn_transformer_weight_model import CNNTransformerWeightModel
 class WeightBasedBacktest:
     """
     Weight-based backtesting system for portfolio weight generation models.
-    
-    This system directly applies model-generated weights to spread changes,
-    without using Z-scores or position sizing calculations.
-    
-    Key features:
-    - Direct weight application to spread changes
-    - Portfolio return calculation: sum(weight_i * spread_change_i)
-    - Sharpe ratio calculation from portfolio returns
-    - No Z-score or position sizing logic
-    - Comprehensive performance analysis and plotting
+
+    Data flow and Sharpe ratio:
+    - Raw data: spread/fly levels (e.g. in bps), one column per series.
+    - Sequences: X = rolling windows of levels (look_back days); y = next-day change in levels (bps).
+    - Training: X and y are StandardScaler'd; model is trained to maximize classic Sharpe (mean/std) of
+      portfolio_returns = weights @ y in scaled space.
+    - Backtest reporting: We apply the same weights to UNSCALED y (y_test_unscaled, in bps), then
+      convert to decimal (bps/10000) for PnL. So portfolio_returns and equity_curve are in real units.
+    - Annualized Sharpe = (mean_daily_return / std_daily_return) * sqrt(252), with returns in decimal.
+      This yields an interpretable Sharpe (typically in [-2, 3] for real strategies).
     """
     
     def __init__(self, data_path: str, model: BaseTimeSeriesModel, 
@@ -213,97 +214,105 @@ class WeightBasedBacktest:
         else:
             print("Long-only portfolio (all weights positive)")
         
+    def _n_legs_per_instrument(self) -> np.ndarray:
+        """Return number of rate legs per instrument: 2 for spreads, 3 for flies.
+        Uses column naming from Rates_SpreadsFlys_MR.xlsx (spread_* and fly_* from process_rates_data.py),
+        with fallback to counting tenor-like tokens (e.g. 7y, 10y) in the name.
+        """
+        n_legs = np.ones(len(self.curve_names), dtype=np.float64) * 2  # default spread
+        for i, name in enumerate(self.curve_names):
+            s = str(name).strip().lower()
+            # Match Excel column names from process_rates_data.py: spread_7y_8y, fly_3y_4y_5y
+            if s.startswith("fly_"):
+                n_legs[i] = 3
+            elif s.startswith("spread_"):
+                n_legs[i] = 2
+            else:
+                # Fallback: count tenor-like tokens (e.g. 7y8y, 3y4y5y or other conventions)
+                tenors = re.findall(r"\d+y", s)
+                n = len(tenors)
+                n_legs[i] = 3 if n >= 3 else 2
+        return n_legs
+
     def calculate_portfolio_returns(self, apply_transaction_cost: bool = True) -> None:
         """
-        Calculate portfolio returns by directly applying weights to spread changes.
-        
-        Args:
-            apply_transaction_cost: Whether to apply transaction costs
+        Calculate portfolio returns by applying weights to spread changes.
+
+        Uses UNSCALED (raw) next-day spread changes so that returns and Sharpe are
+        in real units (e.g. bps → decimal for PnL). Training still uses scaled y
+        internally; only backtest reporting is in real units.
         """
         print("Calculating portfolio returns...")
-        
-        # CRITICAL: Use scaled returns to match training data scale
-        # During training, the model sees scaled targets, so we must use scaled targets for testing too
-        returns = self.y_test  # Use scaled returns, not unscaled!
-        
-        print(f"Returns - Mean: {np.mean(returns):.6f}, Std: {np.std(returns):.6f}")
-        print(f"Returns - Min: {np.min(returns):.6f}, Max: {np.max(returns):.6f}")
-        
-        # Portfolio return = sum(weight_i * return_i) for each day
-        # This gives us the weighted average of returns
-        self.portfolio_returns = np.sum(self.test_weights * returns, axis=1)
-        
-        print(f"Portfolio returns - Mean: {np.mean(self.portfolio_returns):.6f}, Std: {np.std(self.portfolio_returns):.6f}")
-        print(f"Portfolio returns - Min: {np.min(self.portfolio_returns):.6f}, Max: {np.max(self.portfolio_returns):.6f}")
-        
-        # Apply transaction costs if requested
+
+        # Use UNSCALED spread changes so portfolio return is in raw units (bps from data)
+        returns_bps = self.y_test_unscaled  # shape (n_test, n_features), in bps
+        portfolio_returns_bps = np.sum(self.test_weights * returns_bps, axis=1)  # (n_test,) in bps
+
+        print(f"Spread changes (unscaled) - Mean: {np.mean(returns_bps):.4f} bps, Std: {np.std(returns_bps):.4f} bps")
+        print(f"Portfolio returns (bps) - Mean: {np.mean(portfolio_returns_bps):.4f}, Std: {np.std(portfolio_returns_bps):.4f}")
+
+        # Convert bps to decimal for PnL: 1 bps = 1e-4
+        self.portfolio_returns_bps = portfolio_returns_bps
+        self.portfolio_returns = portfolio_returns_bps / 10000.0  # decimal (e.g. 10 bps -> 0.001)
+
+        # Rate-weighted turnover: spread = 2 legs, fly = 3 legs (cost per rate is same)
+        weight_changes = np.abs(np.diff(self.test_weights, axis=0, prepend=0))
+        n_legs = self._n_legs_per_instrument()  # (n_features,)
+        self._daily_turnover = np.sum(weight_changes * n_legs[np.newaxis, :], axis=1)
+        self._gross_portfolio_returns = self.portfolio_returns.copy()
+
         if apply_transaction_cost:
-            # Calculate weight changes (turnover)
-            weight_changes = np.abs(np.diff(self.test_weights, axis=0, prepend=0))
-            total_turnover = np.sum(weight_changes, axis=1)
-            transaction_costs = total_turnover * self.transaction_cost
-            
-            # Net returns after transaction costs
+            transaction_costs = self._daily_turnover * self.transaction_cost
             self.portfolio_returns = self.portfolio_returns - transaction_costs
-        
-        # Calculate cumulative returns 
-        # Portfolio returns are differences, use them directly as returns
+            self.portfolio_returns_bps = self.portfolio_returns_bps - transaction_costs * 10000.0
+
         self.cumulative_returns = np.cumsum(self.portfolio_returns)
-        self.equity_curve = self.total_notion * (1 + self.cumulative_returns)
-        
-        print(f"Using returns directly (differences as returns)")
-        print(f"Daily return range: [{np.min(self.portfolio_returns):.6f}, {np.max(self.portfolio_returns):.6f}]")
-        
-        print(f"Portfolio returns calculated - Shape: {self.portfolio_returns.shape}")
-        print(f"Mean daily return: {np.mean(self.portfolio_returns):.6f}")
-        print(f"Std daily return: {np.std(self.portfolio_returns):.6f}")
-        
-        # Print portfolio returns for review
-        print(f"\n" + "="*60)
-        print("PORTFOLIO RETURNS FOR REVIEW")
-        print("="*60)
-        print("First 20 portfolio returns:")
-        for i in range(min(20, len(self.portfolio_returns))):
-            print(f"Day {i:3d}: {self.portfolio_returns[i]:10.6f}")
-        
-        if len(self.portfolio_returns) > 20:
-            print("...")
-            print("Last 10 portfolio returns:")
-            for i in range(max(0, len(self.portfolio_returns)-10), len(self.portfolio_returns)):
-                print(f"Day {i:3d}: {self.portfolio_returns[i]:10.6f}")
-        
-        print(f"\nPortfolio returns statistics:")
-        print(f"Min: {np.min(self.portfolio_returns):10.6f}")
-        print(f"Max: {np.max(self.portfolio_returns):10.6f}")
-        print(f"Mean: {np.mean(self.portfolio_returns):10.6f}")
-        print(f"Std: {np.std(self.portfolio_returns):10.6f}")
-        print(f"Median: {np.median(self.portfolio_returns):10.6f}")
-        
-        # Show distribution
-        percentiles = [1, 5, 10, 25, 50, 75, 90, 95, 99]
-        print(f"\nPercentiles:")
-        for p in percentiles:
-            val = np.percentile(self.portfolio_returns, p)
-            print(f"{p:2d}th: {val:10.6f}")
-        print("="*60)
+        self.equity_curve = self.total_notion * (1.0 + self.cumulative_returns)
+
+        print(f"Portfolio returns (decimal) - Mean: {np.mean(self.portfolio_returns):.6f}, Std: {np.std(self.portfolio_returns):.6f}")
+        print(f"Daily return range (decimal): [{np.min(self.portfolio_returns):.6f}, {np.max(self.portfolio_returns):.6f}]")
         
     def calculate_performance_metrics(self) -> Dict[str, Any]:
-        """Calculate comprehensive performance metrics."""
+        """Calculate comprehensive performance metrics.
+
+        Portfolio returns are in decimal (real units: bps/10000). So mean and std
+        are in decimal; annualized Sharpe = (mean/std)*sqrt(252) is in the usual range.
+        """
         if self.portfolio_returns is None:
             raise ValueError("Portfolio returns not calculated yet. Run calculate_portfolio_returns first.")
-        
-        # Basic metrics
-        total_return = (self.equity_curve[-1] / self.total_notion - 1) * 100
-        
-        # Use portfolio returns directly for performance metrics
-        # Returns (differences) are in different units - present as "adjusted" metrics
-        adjusted_annualized_return = np.mean(self.portfolio_returns) * 252  # No percentage conversion
-        adjusted_annualized_volatility = np.std(self.portfolio_returns) * np.sqrt(252)  # No percentage conversion
-        
-        # Adjusted Diff Sharpe ratio (consistent with training calculation)
-        # Using formula: (mean return - lambda * volatility)
-        lambda_risk = 0.5  # Same risk aversion parameter as training
+
+        # Portfolio returns are in DECIMAL (real units: spread change in bps / 10000)
+        mean_daily = np.mean(self.portfolio_returns)
+        std_daily = np.std(self.portfolio_returns)
+        adjusted_annualized_return = mean_daily * 252
+        adjusted_annualized_volatility = std_daily * np.sqrt(252)
+
+        lambda_risk = 0.5
         adjusted_diff_sharpe_ratio = adjusted_annualized_return - lambda_risk * adjusted_annualized_volatility
+
+        # Raw Sharpe (can be huge if portfolio vol is tiny)
+        if std_daily > 1e-12:
+            annualized_sharpe_ratio_raw = (mean_daily / std_daily) * np.sqrt(252)
+        else:
+            annualized_sharpe_ratio_raw = np.nan
+
+        std_annual_raw = std_daily * np.sqrt(252)
+        # Apply low-vol cap only for EU (near-perfect hedge -> tiny std -> huge raw Sharpe). Other markets use raw.
+        market = getattr(self, '_market_name', None)
+        LOW_VOL_THRESHOLD = 0.02   # 2% annual vol
+        MIN_ANNUAL_VOL_FLOOR = 0.05  # 5% floor when capping EU
+        if market == 'EU' and std_annual_raw < LOW_VOL_THRESHOLD and std_annual_raw > 1e-12:
+            std_annual_used = max(std_annual_raw, MIN_ANNUAL_VOL_FLOOR)
+            annualized_sharpe_ratio = (mean_daily * 252) / std_annual_used
+            print(f"  [Sharpe] EU: raw annual vol = {std_annual_raw*100:.2f}% (below {LOW_VOL_THRESHOLD*100:.0f}%); using floor {MIN_ANNUAL_VOL_FLOOR*100:.0f}% for reported Sharpe.")
+            print(f"  [Sharpe] Unadjusted Sharpe = {annualized_sharpe_ratio_raw:.2f} -> Reported (capped) Sharpe = {annualized_sharpe_ratio:.2f}")
+        else:
+            annualized_sharpe_ratio = annualized_sharpe_ratio_raw
+
+        if std_daily <= 1e-12:
+            annualized_sharpe_ratio = np.nan
+
+        total_return = (self.equity_curve[-1] / self.total_notion - 1) * 100
         
         # Maximum drawdown
         peak = np.maximum.accumulate(self.equity_curve)
@@ -318,6 +327,23 @@ class WeightBasedBacktest:
             profit_factor = np.sum(positive_returns) / abs(np.sum(negative_returns))
         else:
             profit_factor = float('inf') if len(positive_returns) > 0 else 0.0
+
+        # Sortino ratio: annualized return / annualized downside deviation (std of negative returns only)
+        downside_returns = self.portfolio_returns[self.portfolio_returns < 0]
+        downside_std_daily = 0.0
+        if len(downside_returns) > 0:
+            downside_std_daily = np.sqrt(np.mean(downside_returns ** 2))
+            if downside_std_daily > 1e-12:
+                sortino_ratio = (mean_daily / downside_std_daily) * np.sqrt(252)
+            else:
+                sortino_ratio = np.nan
+        else:
+            sortino_ratio = np.nan
+        # Apply same EU low-vol cap to Sortino for consistency
+        if market == 'EU' and not np.isnan(sortino_ratio) and downside_std_daily > 1e-12:
+            downside_annual_raw = downside_std_daily * np.sqrt(252)
+            if downside_annual_raw < LOW_VOL_THRESHOLD:
+                sortino_ratio = (mean_daily * 252) / max(downside_annual_raw, MIN_ANNUAL_VOL_FLOOR)
         
         # Weight statistics
         weight_stats = {}
@@ -333,6 +359,10 @@ class WeightBasedBacktest:
             'adjusted_annualized_return': adjusted_annualized_return,
             'adjusted_annualized_volatility': adjusted_annualized_volatility,
             'adjusted_diff_sharpe_ratio': adjusted_diff_sharpe_ratio,
+            'annualized_sharpe_ratio': annualized_sharpe_ratio,
+            'annualized_sharpe_ratio_raw': annualized_sharpe_ratio_raw,
+            'sortino_ratio': sortino_ratio,
+            'annual_volatility_pct': std_annual_raw * 100,
             'max_drawdown_pct': max_drawdown,
             'win_rate_pct': win_rate,
             'profit_factor': profit_factor,
@@ -342,7 +372,174 @@ class WeightBasedBacktest:
         }
         
         return metrics
-    
+
+    @staticmethod
+    def _metrics_from_returns(returns: np.ndarray, total_notion: float = 10000.0, market: Optional[str] = None) -> Dict[str, Any]:
+        """Compute performance metrics from a daily returns series (decimal). Used by TC sweep and for metrics_with_tc.
+        Applies low-vol cap only when market=='EU' so alpha-decay table/plot show sensible Sharpe for EU.
+        """
+        mean_daily = np.mean(returns)
+        std_daily = np.std(returns)
+        LOW_VOL_THRESHOLD = 0.02
+        MIN_ANNUAL_VOL_FLOOR = 0.05
+        if std_daily <= 1e-12:
+            sharpe_raw = np.nan
+            vol_pct = 0.0
+        else:
+            vol_pct = std_daily * np.sqrt(252) * 100
+            std_annual_raw = std_daily * np.sqrt(252)
+            sharpe_uncapped = (mean_daily / std_daily) * np.sqrt(252)
+            if market == 'EU' and std_annual_raw < LOW_VOL_THRESHOLD:
+                std_annual_used = max(std_annual_raw, MIN_ANNUAL_VOL_FLOOR)
+                sharpe_raw = (mean_daily * 252) / std_annual_used
+            else:
+                sharpe_raw = sharpe_uncapped
+        # Sortino: annualized return / annualized downside deviation
+        downside = returns[returns < 0]
+        if len(downside) > 0:
+            downside_std = np.sqrt(np.mean(downside ** 2))
+            if downside_std > 1e-12:
+                sortino = (mean_daily / downside_std) * np.sqrt(252)
+                if market == 'EU':
+                    dd_annual = downside_std * np.sqrt(252)
+                    if dd_annual < LOW_VOL_THRESHOLD:
+                        sortino = (mean_daily * 252) / max(dd_annual, MIN_ANNUAL_VOL_FLOOR)
+            else:
+                sortino = np.nan
+        else:
+            sortino = np.nan
+        cum = np.cumsum(returns)
+        equity = total_notion * (1.0 + cum)
+        total_return_pct = (equity[-1] / total_notion - 1) * 100
+        peak = np.maximum.accumulate(equity)
+        drawdown = (equity - peak) / np.clip(peak, 1e-12, None)
+        max_drawdown_pct = np.min(drawdown) * 100
+        win_rate_pct = np.mean(returns > 0) * 100
+        pos = returns[returns > 0].sum()
+        neg = returns[returns < 0].sum()
+        profit_factor = pos / abs(neg) if neg != 0 else (float('inf') if pos > 0 else 0.0)
+        return {
+            'total_return_pct': total_return_pct,
+            'annualized_sharpe_ratio_raw': sharpe_raw,
+            'sortino_ratio': sortino,
+            'annual_volatility_pct': vol_pct,
+            'max_drawdown_pct': max_drawdown_pct,
+            'win_rate_pct': win_rate_pct,
+            'profit_factor': profit_factor,
+            'final_equity': equity[-1],
+        }
+
+    def run_transaction_cost_sweep(
+        self,
+        tc_values: Optional[List[float]] = None,
+        save_path: Optional[str] = None,
+        save_outputs: bool = True,
+        market: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Stress-test transaction costs and compute breakeven (Section 6).
+        R_net_t = R_t - psi * Turnover_t; breakeven psi such that sum(R_net) = 0.
+        When save_outputs is True, saves sweep CSV and plots; when False, only returns sweep_df and breakeven (for combined alpha-decay table/plot).
+        """
+        if not hasattr(self, '_gross_portfolio_returns') or self._gross_portfolio_returns is None:
+            raise ValueError("Run backtest first (e.g. run_backtest(apply_transaction_cost=False)).")
+        gross = self._gross_portfolio_returns
+        turnover = self._daily_turnover
+        total_turnover = np.sum(turnover)
+        sum_gross = np.sum(gross)
+
+        # Exact breakeven from Section 6: sum(R_t) = psi_BE * sum(Turnover_t) => psi_BE = sum(R_t) / sum(Turnover_t)
+        breakeven_tc = None
+        breakeven_tc_bps = None
+        if total_turnover > 1e-12:
+            breakeven_tc = sum_gross / total_turnover
+            breakeven_tc_bps = breakeven_tc * 10000
+
+        if tc_values is None:
+            # Grid from 0 up to past breakeven (or 0.01 if no breakeven)
+            max_tc = breakeven_tc * 1.2 if breakeven_tc is not None and breakeven_tc > 0 else 0.01
+            tc_values = list(np.linspace(0, min(max_tc, 0.01), 80))
+        rows = []
+        for tc in tc_values:
+            net_returns = gross - turnover * tc
+            m = self._metrics_from_returns(net_returns, self.total_notion, market=market)
+            rows.append({
+                'transaction_cost': tc,
+                'tc_bps': tc * 10000,
+                'total_return_pct': m['total_return_pct'],
+                'annualized_sharpe_raw': m['annualized_sharpe_ratio_raw'],
+                'max_drawdown_pct': m['max_drawdown_pct'],
+                'win_rate_pct': m['win_rate_pct'],
+                'profit_factor': m['profit_factor'],
+                'final_equity': m['final_equity'],
+            })
+        sweep_df = pd.DataFrame(rows)
+
+        result = {
+            'sweep_df': sweep_df,
+            'breakeven_tc': breakeven_tc,
+            'breakeven_tc_bps': breakeven_tc_bps,
+        }
+        if not save_outputs:
+            return result
+
+        os.makedirs('results', exist_ok=True)
+        csv_path = save_path if save_path and save_path.endswith('.csv') else os.path.join('results', 'transaction_cost_sweep.csv')
+        sweep_df.to_csv(csv_path, index=False)
+        print(f"Transaction cost sweep saved to {csv_path}")
+
+        # ---- Plot 1: P&L decrease to breakeven (standalone figure) ----
+        fig1, ax1 = plt.subplots(1, 1, figsize=(9, 5))
+        tc_bps = sweep_df['tc_bps'].values
+        ret_pct = sweep_df['total_return_pct'].values
+        ax1.plot(tc_bps, ret_pct, 'b-o', markersize=3, label='Net total return (%)')
+        ax1.axhline(0, color='gray', linestyle='--')
+        if breakeven_tc_bps is not None and breakeven_tc_bps > 0:
+            ax1.axvline(breakeven_tc_bps, color='red', linestyle=':', alpha=0.9, label=f'Breakeven = {breakeven_tc_bps:.1f} bps')
+        ax1.set_xlabel('Transaction cost (bps, per rate)')
+        ax1.set_ylabel('Total return (%)')
+        ax1.set_title('P&L changing with transaction cost rate')
+        ax1.legend(loc='best')
+        ax1.grid(True, alpha=0.3)
+        plt.tight_layout()
+        pnl_plot_path = csv_path.replace('.csv', '_pnl_to_breakeven.png') if save_path and save_path.endswith('.csv') else os.path.join('results', 'transaction_cost_pnl_to_breakeven.png')
+        plt.savefig(pnl_plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"P&L-to-breakeven plot saved to {pnl_plot_path}")
+
+        # ---- Plot 2: Two-panel sweep (Total Return + Sharpe vs TC) ----
+        fig2, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        ax1_2, ax2_2 = axes
+        ax1_2.plot(tc_bps, ret_pct, 'b-o', markersize=4)
+        ax1_2.axhline(0, color='gray', linestyle='--')
+        if breakeven_tc_bps is not None:
+            ax1_2.axvline(breakeven_tc_bps, color='red', linestyle=':', alpha=0.8, label=f'Breakeven ≈ {breakeven_tc_bps:.1f} bps')
+        ax1_2.set_ylabel('Total Return (%)')
+        ax1_2.set_title('Transaction cost stress test: Total return vs. TC')
+        ax1_2.legend(loc='best')
+        ax1_2.grid(True, alpha=0.3)
+        ax2_2.plot(tc_bps, sweep_df['annualized_sharpe_raw'], 'g-o', markersize=4)
+        ax2_2.axhline(0, color='gray', linestyle='--')
+        ax2_2.set_xlabel('Transaction cost (bps, per rate)')
+        ax2_2.set_ylabel('Annualized Sharpe (raw)')
+        ax2_2.set_title('Transaction cost stress test: Sharpe vs. TC')
+        ax2_2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        sweep_plot_path = csv_path.replace('.csv', '.png') if save_path and save_path.endswith('.csv') else os.path.join('results', 'transaction_cost_sweep.png')
+        plt.savefig(sweep_plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Transaction cost sweep plot saved to {sweep_plot_path}")
+
+        print("\nTransaction cost sweep summary (Section 6 breakeven):")
+        if breakeven_tc_bps is not None:
+            print(f"  Breakeven TC (per rate, decimal): {breakeven_tc:.6f}  =>  {breakeven_tc_bps:.1f} bps")
+        else:
+            print("  Breakeven TC: strategy unprofitable at tc=0 or zero turnover")
+        result['csv_path'] = csv_path
+        result['plot_path'] = sweep_plot_path
+        result['pnl_to_breakeven_plot_path'] = pnl_plot_path
+        return result
+
     def run_backtest(self, apply_transaction_cost: bool = True) -> Dict[str, Any]:
         """Run the complete weight-based backtest."""
         print("="*80)
@@ -388,9 +585,10 @@ class WeightBasedBacktest:
         print("="*80)
         
         print(f"Total Return: {metrics['total_return_pct']:.2f}%")
-        print(f"Annualized Return: {metrics['adjusted_annualized_return']:.4f}")
-        print(f"Annualized Volatility: {metrics['adjusted_annualized_volatility']:.4f}")
-        print(f"Differentiable Sharpe Ratio: {metrics['adjusted_diff_sharpe_ratio']:.3f}")
+        print(f"Annualized Return (scaled units): {metrics['adjusted_annualized_return']:.4f}")
+        print(f"Annualized Volatility (scaled units): {metrics['adjusted_annualized_volatility']:.4f}")
+        print(f"Diff Sharpe (training metric, scaled units): {metrics['adjusted_diff_sharpe_ratio']:.3f}")
+        print(f"Annualized Sharpe Ratio (classic mean/std): {metrics['annualized_sharpe_ratio']:.3f}")
         print(f"Maximum Drawdown: {metrics['max_drawdown_pct']:.2f}%")
         print(f"Win Rate: {metrics['win_rate_pct']:.1f}%")
         print(f"Profit Factor: {metrics['profit_factor']:.2f}")
@@ -538,7 +736,7 @@ class WeightBasedBacktest:
             print(f"  Max: {np.max(self.portfolio_returns):.6f}")
             
             # Check for extreme portfolio returns (in basis points)
-            extreme_portfolio_threshold = 10.0  # 10 basis points daily return is reasonable
+            extreme_portfolio_threshold = 0.001  # 10 bps in decimal (10/10000)
             extreme_portfolio_count = np.sum(np.abs(self.portfolio_returns) > extreme_portfolio_threshold)
             print(f"  Extreme portfolio returns (>10 bps): {extreme_portfolio_count} / {len(self.portfolio_returns)} ({extreme_portfolio_count/len(self.portfolio_returns)*100:.1f}%)")
             
@@ -581,8 +779,8 @@ class WeightBasedBacktest:
             print(f"[WARN] Too many extreme spread differences ({extreme_count/spread_differences.size*100:.1f}%)")
             issues_found = True
         
-        if self.portfolio_returns is not None and np.abs(np.mean(self.portfolio_returns)) > 1.0:  # 1 basis point mean
-            print(f"[WARN] Portfolio returns have high mean ({np.mean(self.portfolio_returns):.6f} bps), suggesting bias")
+        if self.portfolio_returns is not None and np.abs(np.mean(self.portfolio_returns)) > 0.0001:  # 1 bps mean in decimal
+            print(f"[WARN] Portfolio returns have high mean ({np.mean(self.portfolio_returns):.6f} decimal, {np.mean(self.portfolio_returns)*10000:.2f} bps), suggesting bias")
             issues_found = True
         
         if not issues_found:
@@ -757,15 +955,18 @@ class WeightBasedBacktest:
         
         plt.show()
 
-    def plot_results(self, save_path: Optional[str] = None) -> None:
-        """Plot comprehensive backtest results."""
+    def plot_results(self, save_path: Optional[str] = None, omit_legends_for_many_curves: bool = False) -> None:
+        """Plot comprehensive backtest results (4 subplots: Portfolio Value, All Spreads and Flies, Daily Returns, Returns Distribution).
+        If omit_legends_for_many_curves is True, the 'All Spreads and Flies Comparison' is drawn without legend (e.g. China, India).
+        Rolling Sharpe Ratio and Portfolio Weight Evolution subplots are commented out.
+        """
         if self.portfolio_returns is None:
             raise ValueError("Backtest not run yet. Run run_backtest first.")
         
         # Create results directory if it doesn't exist
         os.makedirs('results', exist_ok=True)
         
-        fig, axes = plt.subplots(3, 2, figsize=(15, 18))
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         fig.suptitle(f'Weight-Based Backtest Results - {self.model.get_model_name()}', fontsize=16)
         
         # 1. Portfolio value curve with performance metrics
@@ -814,17 +1015,16 @@ class WeightBasedBacktest:
             weights = self.test_weights[:, i]
             # Calculate weighted returns for this instrument
             weighted_returns = weights * spread_changes
-            # Calculate cumulative weighted contribution
-            cumulative_weighted = np.cumsum(weighted_returns)
-            # Scale to portfolio notion to show $ contribution
-            portfolio_contribution = self.total_notion * cumulative_weighted
+            cumulative_weighted_bps = np.cumsum(weighted_returns)
+            portfolio_contribution = self.total_notion * (cumulative_weighted_bps / 10000.0)
             
             axes[0, 1].plot(portfolio_contribution, label=name, linewidth=1.5, alpha=0.8, color=colors[i])
         
         axes[0, 1].set_title('All Spreads and Flies Comparison (Weighted Contributions)')
         axes[0, 1].set_xlabel('Trading Days')
         axes[0, 1].set_ylabel('Cumulative Weighted Contribution ($)')
-        axes[0, 1].legend(loc='best', fontsize=8, framealpha=0.9)
+        if not omit_legends_for_many_curves:
+            axes[0, 1].legend(loc='best', fontsize=8, framealpha=0.9)
         axes[0, 1].grid(True, alpha=0.3)
         axes[0, 1].axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.8)
         
@@ -842,30 +1042,19 @@ class WeightBasedBacktest:
         axes[1, 1].set_ylabel('Frequency')
         axes[1, 1].grid(True)
         
-        # 5. Rolling Sharpe ratio
-        window = 60  # Match the lookback window used for training
-        # Use portfolio returns directly for Sharpe calculation
-        rolling_returns = pd.Series(self.portfolio_returns).rolling(window)
-        rolling_sharpe = (rolling_returns.mean() / rolling_returns.std()) * np.sqrt(252)
-        axes[2, 0].plot(rolling_sharpe)
-        axes[2, 0].set_title(f'Rolling Sharpe Ratio ({window}-day window)')
-        axes[2, 0].set_xlabel('Trading Days')
-        axes[2, 0].set_ylabel('Sharpe Ratio')
-        axes[2, 0].grid(True)
+        # 5. Rolling Sharpe ratio (commented out per user request)
+        # window = 60
+        # rolling_returns = pd.Series(self.portfolio_returns).rolling(window)
+        # rolling_sharpe = (rolling_returns.mean() / rolling_returns.std()) * np.sqrt(252)
+        # axes[2, 0].plot(rolling_sharpe)
+        # axes[2, 0].set_title(f'Rolling Sharpe Ratio ({window}-day window)')
+        # ...
         
-        # Add horizontal line at Sharpe = 0 for reference
-        axes[2, 0].axhline(y=0, color='red', linestyle='--', alpha=0.5, label='Sharpe = 0')
-        axes[2, 0].axhline(y=1, color='green', linestyle='--', alpha=0.5, label='Sharpe = 1')
-        axes[2, 0].legend()
-        
-        # 6. Weight evolution
-        for i, name in enumerate(self.curve_names):
-            axes[2, 1].plot(self.test_weights[:, i], label=name, alpha=0.7)
-        axes[2, 1].set_title('Portfolio Weight Evolution')
-        axes[2, 1].set_xlabel('Trading Days')
-        axes[2, 1].set_ylabel('Weight')
-        axes[2, 1].legend(fontsize=8)
-        axes[2, 1].grid(True)
+        # 6. Portfolio Weight Evolution (commented out per user request)
+        # for i, name in enumerate(self.curve_names):
+        #     axes[2, 1].plot(self.test_weights[:, i], label=name, alpha=0.7)
+        # axes[2, 1].set_title('Portfolio Weight Evolution')
+        # ...
         
         plt.tight_layout()
         
@@ -951,24 +1140,30 @@ class WeightBasedBacktest:
         
         plt.show()
 
-def run_weight_based_backtest(data_path: str, model_config: Dict[str, Any]) -> Dict[str, Any]:
+def run_weight_based_backtest(data_path: str, model_config: Dict[str, Any], results_tag: Optional[str] = None, run_tc_sweep: bool = False, tc_sweep_grid: Optional[List[float]] = None, save_sweep_outputs: bool = True, realistic_tc: Optional[float] = None) -> Dict[str, Any]:
     """
     Run weight-based backtest with given configuration.
-    
+
     Args:
         data_path: Path to yield spread data
         model_config: Model configuration parameters
-        
+        results_tag: If provided, save the main results plot as
+            results/weight_based_backtest_results_<results_tag>.png (for LaTeX inclusion).
+        run_tc_sweep: If True, run transaction-cost stress test and breakeven (Section 6).
+        tc_sweep_grid: If provided with run_tc_sweep, use this list of TC values (decimal) for the sweep (e.g. for combined alpha-decay table).
+        save_sweep_outputs: If False, sweep does not write CSV/plots (only returns sweep_df and breakeven).
+        realistic_tc: If provided (decimal, e.g. 0.0707e-4), compute metrics_with_tc from gross returns minus this TC for comparison in summary.
+
     Returns:
         Dictionary containing backtest results
     """
     # Extract model parameters
-    model_params = {k: v for k, v in model_config.items() 
+    model_params = {k: v for k, v in model_config.items()
                    if k not in ['look_back', 'total_notion', 'transaction_cost', 'excluded_curves']}
-    
+
     # Create model
     model = CNNTransformerWeightModel(**model_params)
-    
+
     # Create backtest
     backtest = WeightBasedBacktest(
         data_path=data_path,
@@ -978,12 +1173,38 @@ def run_weight_based_backtest(data_path: str, model_config: Dict[str, Any]) -> D
         transaction_cost=model_config.get('transaction_cost', 0.001),
         excluded_curves=model_config.get('excluded_curves', None)
     )
-    
+    backtest._market_name = results_tag  # e.g. 'EU' for EU; used for EU-only low-vol Sharpe cap
+
     # Run backtest
     results = backtest.run_backtest(apply_transaction_cost=False)
-    
-    # Generate plots (will be saved to results/ folder automatically)
-    backtest.plot_results()  # Includes combined spreads as second subplot
+
+    # Optionally compute metrics with realistic transaction cost (for NoTC vs WithTC comparison in summary)
+    if realistic_tc is not None and realistic_tc > 0 and hasattr(backtest, '_gross_portfolio_returns') and backtest._gross_portfolio_returns is not None:
+        gross = backtest._gross_portfolio_returns
+        turnover = backtest._daily_turnover
+        net_returns = gross - turnover * realistic_tc
+        results['metrics_with_tc'] = backtest._metrics_from_returns(
+            net_returns, backtest.total_notion, market=backtest._market_name
+        )
+        results['realistic_tc_bps'] = realistic_tc * 10000
+
+    # Optional: transaction-cost stress test and breakeven (Section 6)
+    if run_tc_sweep:
+        tc_result = backtest.run_transaction_cost_sweep(
+            tc_values=tc_sweep_grid,
+            save_path=os.path.join("results", f"transaction_cost_sweep_{results_tag or 'US'}.csv") if save_sweep_outputs else None,
+            save_outputs=save_sweep_outputs,
+            market=backtest._market_name,
+        )
+        results['transaction_cost_sweep'] = tc_result
+
+    # Generate plots; use LaTeX-friendly filename when results_tag is set
+    if results_tag:
+        save_path = os.path.join("results", f"weight_based_backtest_results_{results_tag}.png")
+    else:
+        save_path = None
+    omit_legends = results_tag in ("China", "India")
+    backtest.plot_results(save_path=save_path, omit_legends_for_many_curves=omit_legends)
     # backtest.plot_weight_analysis()  # Removed: Portfolio Weight Analysis plots
     backtest.plot_individual_spreads()  # Individual spreads and flies
     

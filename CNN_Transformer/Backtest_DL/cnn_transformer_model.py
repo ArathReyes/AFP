@@ -139,6 +139,28 @@ def compute_portfolio_sharpe_loss(weights: torch.Tensor, targets: torch.Tensor,
     # Return negative Diff Sharpe ratio for minimization
     return -diff_sharpe_ratio
 
+
+def compute_portfolio_sharpe_classic_loss(weights: torch.Tensor, targets: torch.Tensor,
+                                         eps: float = 1e-8) -> torch.Tensor:
+    """
+    Negative classic Sharpe ratio (mean / std) for minimization.
+    Used when you want to train on the interpretable Sharpe (typically in [-2, 3] when annualized).
+
+    Args:
+        weights: Portfolio weights (batch_size, num_spreads), already normalized.
+        targets: Scaled returns (batch_size, num_spreads).
+        eps: Small constant for numerical stability when std is near zero.
+
+    Returns:
+        Negative Sharpe (to minimize). Same optimum as annualized version (scale-invariant).
+    """
+    portfolio_returns = torch.sum(weights * targets, dim=1)  # (batch_size,)
+    mean_r = torch.mean(portfolio_returns)
+    std_r = torch.std(portfolio_returns) + eps
+    sharpe = mean_r / std_r
+    return -sharpe
+
+
 class PositionalEncoding(nn.Module):
     """Injects positional information into the input sequence."""
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
