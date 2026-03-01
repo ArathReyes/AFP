@@ -108,3 +108,42 @@ def plot_time_series(df, title, x_label, y_label, template="plotly_white"):
 
     return fig
 
+
+def plot_alpha_decay(sharpes: pd.DataFrame):
+    # 1. Setup the theme and figure
+    sns.set_theme(style="whitegrid", context="talk")
+    plt.figure(figsize=(12, 8))
+
+    # 2. Define specific palettes for each group
+    dm_colors = sns.color_palette("Blues_d", 2)
+    latam_colors = sns.color_palette("Greens_d", 3)
+    asia_colors = sns.color_palette("Reds_d", 2)
+
+    # 3. Map countries to colors
+    color_map = {
+        'US': dm_colors[0], 'EU': dm_colors[1],
+        'Mexico': latam_colors[0], 'Chile': latam_colors[1], 'Brazil': latam_colors[2],
+        'India': asia_colors[0], 'China': asia_colors[1]
+    }
+
+    # 4. Plot each country
+    for country in sharpes.columns:
+        plt.plot(sharpes.index, sharpes[country], 
+                label=country, 
+                color=color_map[country], 
+                marker='o', 
+                markevery=10, 
+                markersize=5, 
+                linewidth=2.5)
+
+    # 5. Add baseline and labels
+    plt.axhline(y=0, color='black', linestyle='-', linewidth=1.5, alpha=0.8)
+    plt.title('Alpha Decay', fontsize=18, fontweight='bold', pad=20)
+    plt.xlabel('Transaction Cost (bps)', fontsize=14)
+    plt.ylabel('Sharpe Ratio', fontsize=14)
+
+    # 6. Move the legend outside to avoid overlap
+    plt.legend(title='Country',  loc='lower left', borderaxespad=0.)
+
+    plt.tight_layout()
+    plt.show()

@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
+import quantstats
 
 
 def get_hurst_exponent(time_series, max_lag=20):
@@ -149,3 +150,20 @@ def strategy_results(returns, risk_free_rate=0.0, freq=252):
     }
     
     return pd.Series(stats)
+
+def strategy_summary_statistics(IL: pd.Series):
+    try:
+        calmar = quantstats.stats.calmar(IL.astype(float))['returns']
+    except IndexError:
+        calmar = np.nan
+    return pd.Series({
+            'sharpe': quantstats.stats.sharpe(IL.astype(float)),
+            'cagr': quantstats.stats.cagr(IL.astype(float)),
+            'volatility': quantstats.stats.volatility(IL.astype(float)),
+            'sortino': quantstats.stats.sortino(IL.astype(float)),
+            'calmar': calmar,
+            'skew': quantstats.stats.skew(IL.astype(float)),
+            'kurtosis': quantstats.stats.kurtosis(IL.astype(float)),
+            'max_drawdown': quantstats.stats.max_drawdown(IL.astype(float)),
+            'win_rate': quantstats.stats.win_rate(IL.astype(float)),
+            'daily_value_at_risk': quantstats.stats.value_at_risk(IL.astype(float))})

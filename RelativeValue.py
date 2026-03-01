@@ -11,7 +11,7 @@ from plotly.subplots import make_subplots
  
 from Dates import from_excel_date, bump_date
 from PCA import yield_curve_decomposition
-from Stats import analyze_stationarity
+from Stats import analyze_stationarity, strategy_summary_statistics
 
 import os
 import sys
@@ -38,15 +38,23 @@ class RelativeValue:
         self.vt = config["Volatility Target"]
         self.cap = config["Cap"]
         file = 'FX Forwards' if 'fx' in country.lower() else 'Rates'
-        self.rates = pd.read_excel(PATH +f'/data/{file}.xlsx', index_col=0, sheet_name=config["Curve Name"])[self.tenors]
+        self.rates = pd.read_excel(PATH + f'/data/{file}.xlsx', index_col=0, sheet_name=config["Curve Name"], parse_dates=True)[self.tenors]
         self.rates.index.rename('Date', inplace=True)
         self.rates.drop('Ticker',inplace=True)
-        if 'fx' not in country.lower():
-            self.rates.index = self.rates.index.map(from_excel_date) 
+        try:
+            self.rates.index = pd.to_datetime(self.rates.index)
+        except:
+            try:
+                self.rates.index = self.rates.index.map(from_excel_date) 
+            except TypeError:
+                self.rates.index = self.rates.index.map(int)
+                self.rates.index = self.rates.index.map(from_excel_date)
         self.rates.index = [d.date() for d in self.rates.index]
         self.rates.dropna(inplace=True)
-        if 'fx' not in country.lower():
-            self.rates /= 100
+
+        self.rates /= 100
+        self.start_date = bump_date(self.rates.index[-1], '-15Y')
+        self.rates = self.rates[self.rates.index >= self.start_date]
         self.rolling_volatilities = self.rates.diff().rolling(self.vol_window).std() * np.sqrt(252)
 
 
@@ -114,7 +122,8 @@ class RelativeValue:
         pnl = pos.shift(lag) * self.rates.diff()  - pos.diff().abs() * tc
         pnl.dropna(inplace=True)
         IL = 100*(1 + pnl.sum(axis=1)).cumprod()
-        return pnl, IL
+        breakeven = (pos.shift(lag) * self.rates.diff()).sum(axis=1).sum() / (pos.diff().abs()).sum(axis=1).sum()
+        return pnl, IL, breakeven
     
     def update_tenors(self):
         """
@@ -132,7 +141,7 @@ class RelativeValue:
             for c in confidence_list:
                 pos  = self.get_weights(confidence=c, buffer=b, window=self.window,
                                         vol_window=self.vol_window, volatility_target=self.vt, cap=self.cap)
-                pnl, _ = self.compute_pnl(pos, tc=self.tc, lag=1) 
+                pnl, _, _= self.compute_pnl(pos, tc=self.tc, lag=1) 
                 pnl = pnl.sum(axis=1)
                 sharpe_ratio = (pnl.mean() / pnl.std()) * np.sqrt(252)
                 sharpes.loc[b,c] = sharpe_ratio
@@ -149,7 +158,7 @@ class RelativeValue:
             rv_ = self.rates.diff().rolling(21*vw).std() * np.sqrt(252)
             for w in window_list:
                 pos  = self.get_weights(window=21*w, vol_window= 21*vw, confidence=0.5, buffer=0.0, volatility_target=self.vt, cap=self.cap)
-                pnl, IL = self.compute_pnl(pos, tc=self.tc, lag=1) 
+                pnl, IL, _ = self.compute_pnl(pos, tc=self.tc, lag=1) 
                 pnl = pnl.sum(axis=1)
                 sharpe_ratio = (pnl.mean() / pnl.std()) * np.sqrt(252)
                 sharpes.loc[vw, w] = sharpe_ratio
@@ -167,7 +176,7 @@ class RelativeValue:
                                 confidence=0.5, buffer= 0.0,
                                 volatility_target=self.vt, cap=self.cap)
         for lag in lags:
-                pnl, _ = self.compute_pnl(pos, tc=0.0, lag=lag) 
+                pnl, _, _ = self.compute_pnl(pos, tc=0.0, lag=lag) 
                 pnl = pnl.sum(axis=1)
                 sharpes[lag] = (pnl.mean() / pnl.std()) * np.sqrt(252)
 
@@ -423,6 +432,14 @@ class RelativeValue:
         self.lagged_sharpes = lagged_sharpes
         print("="*100)
 
+    def report(self, save: bool = True):
+        self.summary = strategy_summary_statistics(self.IL)
+        self.summary['breakeven'] = self.breackeven
+        self.summary.name = self.country
+        if save:
+            self.summary.to_csv(PATH + f'/reports/backtests/PCA/Summary_{self.country}.csv')
+            self.IL.to_csv(PATH + f'/reports/backtests/PCA/ts_PCA_{self.country}.csv')
+            quantstats.reports.html(self.IL.astype(float), output=PATH + f'/reports/backtests/PCA/{self.country}_Backtest.html', title = f'{self.country} Relative Value Strategy')
 
     
     def backtest(self,
@@ -452,12 +469,120 @@ class RelativeValue:
         print("="*100)
         print("BACKTEST")
         print("-"*100)
-        print(f"  Parameters | Confidence: {confidence} | Buffer: {buffer} | Window: {window} | Volatility Window: {vol_window} | Volatility Target: {vol_window}")
+        print(f"  Parameters | Confidence: {confidence} | Buffer: {buffer} | Window: {window} | Volatility Window: {vol_window} | Volatility Target: {volatility_target}")
         pos = self.get_weights(confidence=confidence, buffer=buffer,
                                window=window, vol_window=vol_window,
                                volatility_target=volatility_target,
                                cap=cap)
-        self.pnl_backtest, IL = self.compute_pnl(pos=pos, tc=tc, lag=lag)
-        IL.index = pd.to_datetime(IL.index)
-        quantstats.reports.html(IL.astype(float), output=f'{self.country}_Backtest.html', title = f'{self.country} Relative Value Strategy')
+        self.pnl_backtest, self.IL, self.breackeven = self.compute_pnl(pos=pos, tc=tc, lag=lag)
+        self.IL.index = pd.to_datetime(self.IL.index)
         print("="*100)
+
+class FlyRV:
+
+    def __init__(self, country: str, short_wing: str, belly: str, long_wing: str,
+                 lookback : str = '5Y'):
+        self.country = country
+        self.short_wing = short_wing
+        self.belly = belly
+        self.long_wing = long_wing
+        self.lookback = lookback
+
+        with open(PATH + '/config.json') as f:
+            config = json.load(f)[country]
+        tenors = config["Tenors"]
+        file = 'FX Forwards' if 'fx' in country.lower() else 'Rates'
+        self.rates = pd.read_excel(PATH + f'/data/{file}.xlsx', index_col=0, sheet_name=config["Curve Name"], parse_dates=True)[tenors]
+        self.rates.index.rename('Date', inplace=True)
+        self.rates.drop('Ticker',inplace=True)
+        try:
+            self.rates.index = pd.to_datetime(self.rates.index)
+        except:
+            try:
+                self.rates.index = self.rates.index.map(from_excel_date) 
+            except TypeError:
+                self.rates.index = self.rates.index.map(int)
+                self.rates.index = self.rates.index.map(from_excel_date)
+        self.rates.index = [d.date() for d in self.rates.index]
+        self.rates.dropna(inplace=True)
+
+        self.rates /= 100
+        self.start_date = bump_date(self.rates.index[-1], '-15Y')
+        self.rates = self.rates[self.rates.index >= self.start_date]
+
+    def get_residuals(self):
+        print(f"="*100)
+        print(f"Getting PCA residuals ...")
+
+        start_date = bump_date(self.rates.index[1], self.lookback)
+        dates = self.rates.loc[start_date:].index
+        residuals = pd.DataFrame(index=dates, columns= self.rates.columns)
+        explained_variance = pd.DataFrame(index=dates, columns=['Level', 'Slope', 'Curvature'])
+        pca_scores = pd.DataFrame(index=dates, columns=['Level', 'Slope', 'Curvature'])
+        weights = pd.DataFrame(columns= [self.short_wing, self.belly, self.long_wing], index = dates)
+        for i, d in enumerate(dates):
+            start = bump_date(d, '-' + self.lookback)
+            yield_curve = self.rates[(self.rates.index >= start) & (self.rates.index <=d)].dropna()
+            res = yield_curve_decomposition(yield_curve)
+            residuals.loc[d] = res['residuals'].iloc[-1]
+            explained_variance.loc[d] = res['explained_variance']
+            pca_scores.loc[d] = res['scores'].loc[d].values
+            weights.loc[d] = self.neutralize_fly(res['loadings'])
+        print(f"Residuals successfully computed")
+        print(f"="*100)
+        self.pca_scores, self.residuals, self.weights_ = pca_scores, residuals, weights
+
+    def neutralize_fly(self, loadings: pd.DataFrame):
+        wings_loadings= loadings[['Level', 'Slope']].loc[[self.short_wing, self.long_wing]].T
+        belly_loadings = loadings[['Level', 'Slope']].loc[[self.belly]].T
+        x = np.linalg.solve(wings_loadings.to_numpy(), belly_loadings.to_numpy())
+        weights = pd.Series(np.array([x[0, 0], -1.0, x[1, 0]]), index = [self.short_wing, self.belly, self.long_wing])
+        return weights
+
+    def backtest(self, window : int = 63, vol_window: int = 21,
+                 confidence: float = 0.5, tc : float = 0.0, vt: float = 0.2,
+                 exit_confidence: float = 0.5):
+        self.window = window
+        self.vol_window = vol_window
+        self.confidence = confidence
+        self.threshold = norm.ppf(self.confidence) 
+        self.exit_threshold = norm.ppf(exit_confidence)
+        self.tc = tc
+        self.vt = vt
+
+        index_ = self.weights_.index.intersection(self.rates.index)
+        fly = 100* (self.rates[[self.short_wing, self.belly, self.long_wing]].loc[index_] *self.weights_.loc[index_]).sum(axis = 1)
+        self.rv = fly.diff().rolling(window = self.window).std().dropna()
+        self.signal = (self.residuals[[self.short_wing, self.belly, self.long_wing]].loc[index_] * self.weights_.loc[index_]).sum(axis = 1)
+        self.z_score = (self.signal - self.signal.rolling(window=self.vol_window).mean()) / self.signal.rolling(window=self.vol_window).std()
+
+        long_entry = self.z_score < -self.threshold
+        short_entry = self.z_score > self.threshold
+        exit_condition = self.z_score.abs() <= self.exit_threshold
+        
+        pos = pd.Series(np.nan, index=self.z_score.index)
+        pos.loc[long_entry] = 1.0
+        pos.loc[short_entry] = -1.0
+        pos.loc[exit_condition] = 0.0
+        
+        pos = pos.ffill().fillna(0.0)
+
+        self.weights = self.vt*self.weights_.mul(pos, axis='rows').div(self.rv, axis='rows')
+        self.pnl =  self.weights.shift(1) * self.rates[[self.short_wing, self.belly, self.long_wing]].diff() - (self.tc)*self.weights.diff().abs()
+        self.breakeven = (self.weights.shift(1) * self.rates[[self.short_wing, self.belly, self.long_wing]].diff()).sum(axis=1).sum() / (self.weights.diff().abs()).sum(axis=1).sum()
+        self.pnl.dropna(inplace=True)
+        self.IL = 100*(1 + self.pnl.sum(axis=1)).cumprod()
+        self.IL.dropna(inplace=True)
+        self.IL.index = pd.to_datetime(self.IL.index)
+        self.IL.name = self.country
+
+    def report(self, save = True):
+        self.summary = strategy_summary_statistics(self.IL)
+        self.summary['breakeven'] = self.breakeven
+        self.summary.name = self.country
+        if save:
+            self.summary.to_csv(PATH + f'/reports/backtests/Flies/Summary_{self.country}.csv')
+            self.IL.to_csv(PATH + f'/reports/backtests/Flies/ts_Fly_RV_{self.country}.csv')
+            quantstats.reports.html(self.IL.astype(float),
+                                    title=f'{self.country} Fly RV Trade',
+                                    output=PATH + f'/reports/backtests/Flies/Fly_RV_{self.country}.html')
