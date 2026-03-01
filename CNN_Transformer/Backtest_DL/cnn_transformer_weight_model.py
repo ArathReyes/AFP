@@ -13,8 +13,10 @@ import os
 
 from base_model import BaseTimeSeriesModel, ModelFactory
 from cnn_transformer_model import (
-    PositionalEncoding, CNN_Block, 
-    compute_portfolio_sharpe_loss, compute_trading_sharpe_loss
+    PositionalEncoding, CNN_Block,
+    compute_portfolio_sharpe_loss,
+    compute_portfolio_sharpe_classic_loss,
+    compute_trading_sharpe_loss,
 )
 
 class CNNTransformerWeightGenerator(nn.Module):
@@ -100,10 +102,10 @@ class CNNTransformerWeightModel(BaseTimeSeriesModel):
                  batch_size: int = 64, learning_rate: float = 0.001, 
                  num_epochs: int = 60, patience: int = 10, device: Optional[str] = None,
                  weight_decay: float = 1e-5, step_size: int = 10, gamma: float = 0.5,
-                 loss_function: str = "portfolio_sharpe", weight_mode: str = "softmax"):
+                 loss_function: str = "portfolio_sharpe_classic", weight_mode: str = "softmax"):
         """
         Initialize CNN+Transformer weight generation model.
-        
+
         Args:
             filter_numbers: List of filter numbers for CNN blocks
             attention_heads: Number of attention heads in transformer
@@ -118,7 +120,9 @@ class CNNTransformerWeightModel(BaseTimeSeriesModel):
             weight_decay: Weight decay for regularization
             step_size: Step size for learning rate scheduler
             gamma: Gamma for learning rate scheduler
-            loss_function: Loss function to use ('portfolio_sharpe', 'trading_sharpe', or 'mse')
+            loss_function: 'portfolio_sharpe_classic' (classic mean/std, default),
+                           'portfolio_sharpe' (diff Sharpe: mean - 0.5*vol),
+                           'trading_sharpe', or 'mse'
             weight_mode: Weight generation mode ('softmax' for long-only, 'tanh' for shorting)
         """
         super().__init__(
@@ -244,7 +248,9 @@ class CNNTransformerWeightModel(BaseTimeSeriesModel):
                 weights = self.model(X_batch)  # (batch_size, n_features)
                 
                 # Use selected loss function
-                if self.loss_function == "portfolio_sharpe":
+                if self.loss_function == "portfolio_sharpe_classic":
+                    loss = compute_portfolio_sharpe_classic_loss(weights, y_batch)
+                elif self.loss_function == "portfolio_sharpe":
                     loss = compute_portfolio_sharpe_loss(weights, y_batch)
                 elif self.loss_function == "trading_sharpe":
                     loss = compute_trading_sharpe_loss(weights, y_batch)
@@ -270,7 +276,9 @@ class CNNTransformerWeightModel(BaseTimeSeriesModel):
                         weights = self.model(X_batch)
                         
                         # Use selected loss function for validation too
-                        if self.loss_function == "portfolio_sharpe":
+                        if self.loss_function == "portfolio_sharpe_classic":
+                            loss = compute_portfolio_sharpe_classic_loss(weights, y_batch)
+                        elif self.loss_function == "portfolio_sharpe":
                             loss = compute_portfolio_sharpe_loss(weights, y_batch)
                         elif self.loss_function == "trading_sharpe":
                             loss = compute_trading_sharpe_loss(weights, y_batch)

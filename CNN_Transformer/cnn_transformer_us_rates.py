@@ -13,8 +13,10 @@ Usage (very similar to LSTM script):
         --epochs 30 --batch-size 128 --lr 1e-3 --patience 6
 
 Outputs:
-- PNG:  ./CNN_Transformer/Results/test_us_rates_forecasts.png
-- XLSX: ./CNN_Transformer/Results/test_us_rates_predictions.xlsx (Actual/Predicted)
+- PNG:  CNN_Transformer/Results/test_rates_forecasts_<sheet>.png (e.g. test_rates_forecasts_CAMARA.png)
+- XLSX: CNN_Transformer/Results/test_rates_predictions_<sheet>.xlsx (Actual/Predicted)
+
+Results are always saved in the Results folder inside the CNN_Transformer directory (same folder as this script), regardless of the current working directory.
 
 Note: For delta target, we reconstruct level predictions with S_{t+1} = S_t + ΔS_{t+1}.
 """
@@ -25,6 +27,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import matplotlib
+matplotlib.use("Agg")  # headless backend so savefig() works without a display (e.g. SSH, batch runs)
 import matplotlib.pyplot as plt
 
 # ---------------- Utils ----------------
@@ -45,7 +49,11 @@ def load_spreads(path: str, sheet: str = None) -> pd.DataFrame:
     if path.lower().endswith((".csv",".txt")):
         df = pd.read_csv(path, index_col = 0)
     elif path.lower().endswith((".xlsx",".xls")):
-        df = pd.read_excel(path, index_col = 0)
+        sheet_name = sheet if sheet is not None else 0
+        try:
+            df = pd.read_excel(path, sheet_name=sheet_name, index_col=0)
+        except (ValueError, TypeError):
+            df = pd.read_excel(path, sheet_name=int(sheet_name) if isinstance(sheet_name, str) and sheet_name.isdigit() else 0, index_col=0)
     else:
         raise ValueError("Unsupported file format. Use CSV or Excel.")
     num_df = df.select_dtypes(include=[np.number]).copy()
@@ -53,6 +61,22 @@ def load_spreads(path: str, sheet: str = None) -> pd.DataFrame:
     if num_df.empty:
         raise ValueError("No numeric spread/fly columns after cleaning.")
     return num_df
+
+
+def _output_tag(sheet, path: str = None) -> str:
+    """Filesystem-safe tag from sheet name for plot/Excel filenames."""
+    if sheet is not None:
+        s = str(sheet).strip().replace(" ", "_")
+        return "".join(c for c in s if c.isalnum() or c in "_-") or "forecasts"
+    if path and path.lower().endswith((".xlsx", ".xls")):
+        try:
+            xl = pd.ExcelFile(path)
+            if xl.sheet_names:
+                s = xl.sheet_names[0].strip().replace(" ", "_")
+                return "".join(c for c in s if c.isalnum() or c in "_-") or "forecasts"
+        except Exception:
+            pass
+    return "forecasts"
 
 
 def time_split(df: pd.DataFrame, train_frac=0.7, val_frac=0.15):
@@ -211,8 +235,15 @@ def main():
     args = ap.parse_args()
     set_seed(args.seed)
 
+    # Results go in CNN_Transformer/Results (next to this script), regardless of cwd
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(_script_dir, "Results")
+    ensure_dirs(out_dir)
+    data_path = args.path if os.path.isabs(args.path) else os.path.normpath(os.path.join(os.getcwd(), args.path))
+    print("Results will be saved to:", os.path.abspath(out_dir))
+
     # Data
-    df = load_spreads(args.path, args.sheet)
+    df = load_spreads(data_path, args.sheet)
     features = df.columns.tolist()
 
     if args.target == "delta":
@@ -326,7 +357,8 @@ def main():
           f"Baseline: RMSE={np.sqrt(base_mse):.4f} MAE={base_mae:.4f} MAPE {base_mape:.4f} sMAPE {base_smape:.4f} MAAPE {base_maape:.4f}")
 
     # ---- Outputs ----
-    out_dir = os.path.join(".", path_, "CNN_Transformer", "Results"); ensure_dirs(out_dir)
+    # out_dir already set above (CNN_Transformer/Results)
+    tag = _output_tag(args.sheet, data_path)
 
     # Plot Actual vs Model
     try:
@@ -352,10 +384,14 @@ def main():
             if j == 0: ax.legend()
         for k in range(j+1, len(axes)): fig.delaxes(axes[k])
         fig.suptitle(f"Test: Actual vs CNN+Transformer (Lookback: {L})", y=0.995, fontsize=12)
-        fig.tight_layout(); fig.savefig(os.path.join(out_dir, "test_us_rates_forecasts.png"), dpi=150, bbox_inches="tight")
-        print("Saved: test_us_rates_forecasts.png")
+        png_path = os.path.join(out_dir, f"test_rates_forecasts_{tag}.png")
+        fig.tight_layout(); fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print("Saved:", png_path)
     except Exception as e:
+        import traceback
         print(f"Plotting skipped due to error: {e}")
+        traceback.print_exc()
 
     # Excel export
     try:
@@ -363,7 +399,7 @@ def main():
         idx = teX_df.index[L : L + N]
         actual_df    = pd.DataFrame(level_true, index=idx, columns=features)
         predicted_df = pd.DataFrame(level_pred, index=idx, columns=features)
-        out_xlsx = os.path.join(out_dir, "test_us_rates_predictions.xlsx")
+        out_xlsx = os.path.join(out_dir, f"test_rates_predictions_{tag}.xlsx")
         with pd.ExcelWriter(out_xlsx) as writer:
             actual_df.to_excel(writer,    sheet_name="Actual")
             predicted_df.to_excel(writer, sheet_name="Predicted")

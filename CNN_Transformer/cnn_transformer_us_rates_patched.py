@@ -16,6 +16,21 @@ Outputs:
 - PNG:  ./CNN_Transformer/Results/test_us_rates_forecasts.png
 - XLSX: ./CNN_Transformer/Results/test_us_rates_predictions.xlsx (Actual/Predicted)
 
+Default (no --sheet): runs all country sheets, writes the performance table to
+  CNN_Transformer/Results/performance_table_countries.csv and .xlsx, and saves one
+  test_rates_forecasts_<sheet>.png per sheet in the same Results folder.
+With --sheet <name>: runs that single sheet only (plot only).
+All results are saved under CNN_Transformer/Results (next to this script), regardless of current working directory.
+
+Forecast metrics produced (per country):
+  - RMSE, MAE: scale-dependent errors.
+  - MAPE_pct, sMAPE_pct: percentage errors (%; sMAPE symmetric).
+  - MAAPE: mean arctangent absolute percentage error (bounded, robust).
+  - R2: coefficient of determination (1 - SS_res/SS_tot).
+  - Correlation: Pearson correlation between predicted and actual.
+  - Baseline_*: same metrics for a rolling-mean baseline (lookback window).
+  - N_test, N_features: number of test points and series (spreads/flies).
+
 Note: For delta target, we reconstruct level predictions with S_{t+1} = S_t + ΔS_{t+1}.
 """
 import argparse, os, math
@@ -25,6 +40,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ---------------- Utils ----------------
@@ -136,6 +153,54 @@ def get_scaler(name: str):
     if name == "minmax":   return MinMaxScalerNP()
     raise ValueError("scale must be one of: standard, robust, minmax")
 
+
+# ---------------- Forecast performance metrics ----------------
+def _mse(a, b): return float(np.mean((a - b) ** 2))
+def _mae(a, b): return float(np.mean(np.abs(a - b)))
+def _mape(pred, actual):
+    denom = np.abs(actual)
+    denom[denom < 1e-12] = np.nan
+    return float(np.nanmean(np.abs((actual - pred) / denom)) * 100)
+def _smape(pred, actual):
+    mean = (np.abs(actual) + np.abs(pred)) / 2
+    mean[mean < 1e-12] = np.nan
+    return float(np.nanmean(np.abs(actual - pred) / mean) * 100)
+def _maape(pred, actual):
+    epsilon = np.finfo(float).eps
+    ape = np.abs((actual - pred) / np.maximum(np.abs(actual), epsilon))
+    return float(np.mean(np.arctan(ape)))
+def _r2(pred, actual):
+    ss_res = np.sum((actual - pred) ** 2)
+    ss_tot = np.sum((actual - np.mean(actual)) ** 2)
+    if ss_tot < 1e-12:
+        return 0.0
+    return float(1 - ss_res / ss_tot)
+def _corr(pred, actual):
+    if pred.size < 2 or np.std(pred) < 1e-12 or np.std(actual) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(pred.ravel(), actual.ravel())[0, 1])
+
+
+def compute_forecast_metrics(level_pred: np.ndarray, level_true: np.ndarray,
+                            baseline: np.ndarray) -> dict:
+    """Compute model vs baseline forecast metrics (level space). All arrays (N, F)."""
+    return {
+        "RMSE": np.sqrt(_mse(level_pred, level_true)),
+        "MAE": _mae(level_pred, level_true),
+        "MAPE_pct": _mape(level_pred, level_true),
+        "sMAPE_pct": _smape(level_pred, level_true),
+        "MAAPE": _maape(level_pred, level_true),
+        "R2": _r2(level_pred, level_true),
+        "Correlation": _corr(level_pred, level_true),
+        "Baseline_RMSE": np.sqrt(_mse(baseline, level_true)),
+        "Baseline_MAE": _mae(baseline, level_true),
+        "Baseline_MAPE_pct": _mape(baseline, level_true),
+        "Baseline_sMAPE_pct": _smape(baseline, level_true),
+        "Baseline_MAAPE": _maape(baseline, level_true),
+        "Baseline_R2": _r2(baseline, level_true),
+    }
+
+
 # ---------------- Model ----------------
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding (Transformer-compatible)."""
@@ -228,12 +293,151 @@ def evaluate(model, loader, device):
     rmse = float(np.sqrt(mse_sum / max(n,1))); mae = float(mae_sum / max(n,1))
     return rmse, mae, np.concatenate(preds, 0), np.concatenate(trues, 0)
 
+
+def run_one_sheet(path: str, sheet: str, args) -> Tuple[dict, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, list, int]:
+    """Run full train/val/test pipeline for one sheet. Returns (metrics, level_pred, level_true, baseline, teX_df, features, L)."""
+    df = load_spreads(path, sheet)
+    features = df.columns.tolist()
+
+    if args.target == "delta":
+        df_y = df.diff().shift(-1).dropna()
+        df_x = df.loc[df_y.index]
+    else:
+        df_y = df.shift(-1).dropna()
+        df_x = df.loc[df_y.index]
+
+    trX_df, vaX_df, teX_df = time_split(df_x)
+    trY_df, vaY_df, teY_df = df_y.loc[trX_df.index], df_y.loc[vaX_df.index], df_y.loc[teX_df.index]
+
+    ScalerX = get_scaler(args.scale)
+    ScalerY = get_scaler(args.scale)
+    X_tr = ScalerX.fit(trX_df.values.copy()).transform(trX_df.values)
+    X_va = ScalerX.transform(vaX_df.values)
+    X_te = ScalerX.transform(teX_df.values)
+    Y_tr = ScalerY.fit(trY_df.values.copy()).transform(trY_df.values)
+    Y_va = ScalerY.transform(vaY_df.values)
+    Y_te = ScalerY.transform(teY_df.values)
+
+    L, H = args.lookback, args.horizon
+    trX, trY = build_sequences(X_tr, Y_tr, L, H)
+    vaX, vaY = build_sequences(X_va, Y_va, L, H)
+    teX, teY = build_sequences(X_te, Y_te, L, H)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CNNTransformer(
+        n_features=len(features), cnn_channels=tuple(args.cnn_ch), kernel_size=args.kernel,
+        attn_heads=args.attn_heads, ff_mult=args.ff_mult, dropout=args.dropout, horizon=H
+    ).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    loss_fn = huber_loss(args.huber_delta)
+    train_loader, val_loader = make_loaders(trX, trY, vaX, vaY, args.batch_size)
+
+    best_val = float("inf")
+    best_state = None
+    patience = args.patience
+    for ep in range(1, args.epochs + 1):
+        model.train()
+        tr_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            yhat = model(xb)
+            loss = loss_fn(yhat, yb)
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+            tr_loss += loss.item() * xb.size(0)
+        tr_loss /= len(train_loader.dataset)
+        model.eval()
+        va_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                va_loss += loss_fn(model(xb), yb).item() * xb.size(0)
+        va_loss /= len(val_loader.dataset)
+        if ep % 5 == 0 or ep == 1:
+            print(f"  Epoch {ep:03d} | train {tr_loss:.6f} | val {va_loss:.6f}")
+        if va_loss < best_val - 1e-6:
+            best_val = va_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience = args.patience
+        else:
+            patience -= 1
+            if patience == 0:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    test_ds = TensorDataset(torch.tensor(teX, dtype=torch.float32), torch.tensor(teY, dtype=torch.float32))
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+    _, _, y_pred_s, y_true_s = evaluate(model, test_loader, device)
+
+    y_pred_raw = np.vstack([ScalerY.inverse_transform(y_pred_s[i, 0, :].reshape(1, -1))
+                            for i in range(y_pred_s.shape[0])])
+    y_true_raw = np.vstack([ScalerY.inverse_transform(y_true_s[i, 0, :].reshape(1, -1))
+                            for i in range(y_true_s.shape[0])])
+    if args.target == "delta":
+        last_levels = teX_df.values[-y_pred_raw.shape[0]-1:-1, :]
+        level_pred = last_levels + y_pred_raw
+        level_true = last_levels + y_true_raw
+    else:
+        level_pred = y_pred_raw
+        level_true = y_true_raw
+    baseline = teX_df.rolling(window=L).mean().values[L-1:-1, :]
+
+    metrics = compute_forecast_metrics(level_pred, level_true, baseline)
+    metrics["N_test"] = level_pred.shape[0]
+    metrics["N_features"] = level_pred.shape[1]
+    return metrics, level_pred, level_true, baseline, teX_df, features, L
+
+
+def _sheet_tag(sheet_name: str) -> str:
+    """Filesystem-safe tag from sheet name for plot/Excel filenames."""
+    s = str(sheet_name).strip().replace(" ", "_")
+    return "".join(c for c in s if c.isalnum() or c in "_-") or "forecasts"
+
+
+def _save_forecast_plot(out_dir: str, level_pred: np.ndarray, level_true: np.ndarray,
+                       baseline: np.ndarray, teX_df: pd.DataFrame, features: list, L: int, tag: str) -> None:
+    """Save test_rates_forecasts_{tag}.png to out_dir."""
+    N = level_pred.shape[0]
+    idx = teX_df.index[L : L + N]
+    n_feats = len(features)
+    n_cols = 2
+    n_rows = int(math.ceil(n_feats / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 2.6 * n_rows), sharex=True)
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+    for j, feat in enumerate(features):
+        ax = axes[j]
+        ax.plot(idx, level_true[:, j], label="Actual")
+        ax.plot(idx, level_pred[:, j], label="CNN+Transformer")
+        ax.plot(idx, baseline[:, j], label="Baseline", alpha=0.65, linestyle="--")
+        maape_j = _maape(level_pred[:, j], level_true[:, j])
+        base_maape_j = _maape(baseline[:, j], level_true[:, j])
+        ax.set_title(f"{feat}  MAAPE={maape_j:.3f} | Baseline MAAPE={base_maape_j:.3f}")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.legend()
+    for k in range(j + 1, len(axes)):
+        fig.delaxes(axes[k])
+    fig.suptitle(f"Test: Actual vs CNN+Transformer (Lookback: {L})", y=0.995, fontsize=12)
+    png_path = os.path.join(out_dir, f"test_rates_forecasts_{tag}.png")
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved:", png_path)
+
+
 # ---------------- Main ----------------
 def main():
     path_ = os.getcwd()
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", default= path_ + "/data/Rates_SpreadsFlys_MR.xlsx")
-    ap.add_argument("--sheet", default="MX FTIIE")
+    ap.add_argument("--sheet", default=None,
+                    help="Single sheet (country) name; if omitted, run all sheets and write country-level table to Results")
     ap.add_argument("--lookback", type=int, default=60)
     ap.add_argument("--horizon",  type=int, default=1)
     ap.add_argument("--epochs",   type=int, default=30)
@@ -253,165 +457,71 @@ def main():
     args = ap.parse_args()
     set_seed(args.seed)
 
-    # Data
-    df = load_spreads(args.path, args.sheet)
-    features = df.columns.tolist()
+    # Results always in CNN_Transformer/Results (next to this script), regardless of cwd
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(_script_dir, "Results")
+    ensure_dirs(out_dir)
+    data_path = args.path if os.path.isabs(args.path) else os.path.normpath(os.path.join(os.getcwd(), args.path))
+    print("Results will be saved to:", os.path.abspath(out_dir))
 
-    if args.target == "delta":
-        # ΔS_{t+1} = S_{t+1} - S_t
-        df_y = df.diff().shift(-1).dropna()
-        df_x = df.loc[df_y.index]
-    else:
-        df_y = df.shift(-1).dropna()      # S_{t+1}
-        df_x = df.loc[df_y.index]
+    # No --sheet: run all country sheets, save table AND one plot+Excel per sheet
+    if args.sheet is None:
+        if not os.path.exists(data_path):
+            print(f"ERROR: File not found: {data_path}")
+            return
+        xls = pd.ExcelFile(data_path)
+        sheets = [s for s in xls.sheet_names if s.lower() != "adf_pvalues"]
+        if not sheets:
+            print("No data sheets found (excluding 'ADF_pvalues').")
+            return
+        print(f"Running CNN+Transformer for {len(sheets)} sheets: {sheets}")
+        rows = []
+        for sheet in sheets:
+            print(f"\n--- Sheet: {sheet} ---")
+            try:
+                metrics, level_pred, level_true, baseline, teX_df, features, L = run_one_sheet(data_path, sheet, args)
+                metrics["Country"] = sheet
+                rows.append(metrics)
+                tag = _sheet_tag(sheet)
+                _save_forecast_plot(out_dir, level_pred, level_true, baseline, teX_df, features, L, tag)
+            except Exception as e:
+                print(f"  Skip '{sheet}': {e}")
+                import traceback
+                traceback.print_exc()
+        if not rows:
+            print("No sheets completed successfully.")
+            return
+        df = pd.DataFrame(rows)
+        # Improvement over baseline (positive = model better)
+        if "Baseline_RMSE" in df.columns and (df["Baseline_RMSE"] > 0).all():
+            df["RMSE_improvement_pct"] = (1 - df["RMSE"] / df["Baseline_RMSE"]) * 100
+        if "Baseline_MAE" in df.columns and (df["Baseline_MAE"] > 0).all():
+            df["MAE_improvement_pct"] = (1 - df["MAE"] / df["Baseline_MAE"]) * 100
+        col_order = ["Country", "RMSE", "MAE", "MAPE_pct", "sMAPE_pct", "MAAPE", "R2", "Correlation",
+                     "Baseline_RMSE", "Baseline_MAE", "Baseline_MAPE_pct", "Baseline_sMAPE_pct", "Baseline_MAAPE", "Baseline_R2",
+                     "RMSE_improvement_pct", "MAE_improvement_pct",
+                     "N_test", "N_features"]
+        df = df[[c for c in col_order if c in df.columns]]
+        csv_path = os.path.join(out_dir, "performance_table_countries.csv")
+        xlsx_path = os.path.join(out_dir, "performance_table_countries.xlsx")
+        df.to_csv(csv_path, index=False)
+        df.to_excel(xlsx_path, index=False)
+        print(f"\nPerformance table saved: {csv_path}")
+        print(f"Performance table saved: {xlsx_path}")
+        return
 
-    trX_df, vaX_df, teX_df = time_split(df_x)
-    trY_df, vaY_df, teY_df = df_y.loc[trX_df.index], df_y.loc[vaX_df.index], df_y.loc[teX_df.index]
+    # Single-sheet: run and save plot + Excel
+    metrics, level_pred, level_true, baseline, teX_df, features, L = run_one_sheet(data_path, args.sheet, args)
+    print(f"Test (raw)  CNN+Transformer: RMSE={metrics['RMSE']:.4f} MAE={metrics['MAE']:.4f} MAPE={metrics['MAPE_pct']:.4f} sMAPE={metrics['sMAPE_pct']:.4f} MAAPE={metrics['MAAPE']:.4f} R2={metrics['R2']:.4f} Corr={metrics['Correlation']:.4f} | "
+          f"Baseline: RMSE={metrics['Baseline_RMSE']:.4f} MAE={metrics['Baseline_MAE']:.4f} MAPE={metrics['Baseline_MAPE_pct']:.4f} sMAPE={metrics['Baseline_sMAPE_pct']:.4f} MAAPE={metrics['Baseline_MAAPE']:.4f} R2={metrics['Baseline_R2']:.4f}")
 
-    ScalerX = get_scaler(args.scale)
-    ScalerY = get_scaler(args.scale)
-    X_tr = ScalerX.fit(trX_df.values.copy()).transform(trX_df.values)
-    X_va = ScalerX.transform(vaX_df.values)
-    X_te = ScalerX.transform(teX_df.values)
-
-    Y_tr = ScalerY.fit(trY_df.values.copy()).transform(trY_df.values)
-    Y_va = ScalerY.transform(vaY_df.values)
-    Y_te = ScalerY.transform(teY_df.values)
-
-    L, H = args.lookback, args.horizon
-    trX, trY = build_sequences(X_tr, Y_tr, L, H)
-    vaX, vaY = build_sequences(X_va, Y_va, L, H)
-    teX, teY = build_sequences(X_te, Y_te, L, H)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = CNNTransformer(
-        n_features=len(features), cnn_channels=tuple(args.cnn_ch), kernel_size=args.kernel,
-        attn_heads=args.attn_heads, ff_mult=args.ff_mult, dropout=args.dropout, horizon=H
-    ).to(device)
-
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    loss_fn = huber_loss(args.huber_delta)
-
-    train_loader, val_loader = make_loaders(trX, trY, vaX, vaY, args.batch_size)
-
-    best_val = float("inf"); best_state = None; patience = args.patience
-    for ep in range(1, args.epochs + 1):
-        model.train(); tr_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            yhat = model(xb); loss = loss_fn(yhat, yb)
-            optim.zero_grad(); loss.backward(); optim.step()
-            tr_loss += loss.item() * xb.size(0)
-        tr_loss /= len(train_loader.dataset)
-
-        # validation
-        model.eval(); va_loss = 0.0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                yhat = model(xb); va_loss += loss_fn(yhat, yb).item() * xb.size(0)
-        va_loss /= len(val_loader.dataset)
-        print(f"Epoch {ep:03d} | train {tr_loss:.6f} | val {va_loss:.6f}")
-
-        if va_loss < best_val - 1e-6:
-            best_val = va_loss
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            patience = args.patience
-        else:
-            patience -= 1
-            if patience == 0:
-                print("Early stopping."); break
-
-    if best_state is not None: model.load_state_dict(best_state)
-
-    # Test evaluation
-    test_ds = TensorDataset(torch.tensor(teX, dtype=torch.float32), torch.tensor(teY, dtype=torch.float32))
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
-    rmse_s, mae_s, y_pred_s, y_true_s = evaluate(model, test_loader, device)
-    
-    def mse(a,b): return float(np.mean((a-b)**2))
-    def mae(a,b): return float(np.mean(np.abs(a-b)))
-    def mape(pred, actual): return float(np.mean(np.abs((actual - pred) / actual)) * 100)
-    def smape(pred, actual):
-        mean = (np.abs(actual) + np.abs(pred)) / 2
-        return float(np.mean(np.abs(actual - pred) / mean) * 100)
-    def maape(pred, actual):
-        epsilon = np.finfo(float).eps
-        ape = np.abs((actual - pred) / np.maximum(np.abs(actual), epsilon))
-        aape = np.arctan(ape)
-        return np.mean(aape)
-    
-    # Inverse scale to level space
-    # y_pred_s, y_true_s are (N, H=1, F)
-    y_pred_raw = np.vstack([ScalerY.inverse_transform(y_pred_s[i, 0, :].reshape(1, -1))
-                            for i in range(y_pred_s.shape[0])])
-    y_true_raw = np.vstack([ScalerY.inverse_transform(y_true_s[i, 0, :].reshape(1, -1))
-                            for i in range(y_true_s.shape[0])])
-
-    # If forecasted deltas, reconstruct levels using last seen levels in teX_df
-    if args.target == "delta":
-        last_levels = teX_df.values[-y_pred_raw.shape[0]-1:-1, :]  # align with sequences end
-        level_pred = last_levels + y_pred_raw
-        level_true = last_levels + y_true_raw
-    else:
-        level_pred = y_pred_raw
-        level_true = y_true_raw
-
-    baseline  = teX_df.rolling(window=L).mean().values[L-1:-1, :]
-    overall_mse = mse(level_pred, level_true); base_mse = mse(baseline, level_true)
-    overall_mae = mae(level_pred, level_true); base_mae = mae(baseline, level_true)
-    overall_mape = mape(level_pred, level_true); base_mape = mape(baseline, level_true)
-    overall_smape = smape(level_pred, level_true); base_smape = smape(baseline, level_true)
-    overall_maape = maape(level_pred, level_true); base_maape = maape(baseline, level_true)
-
-    print(f"Test (raw)  LSTM: RMSE={np.sqrt(overall_mse):.4f} MAE={overall_mae:.4f} MAPE {overall_mape:.4f} sMAPE {overall_smape:.4f} MAAPE {overall_maape:.4f}| "
-          f"Baseline: RMSE={np.sqrt(base_mse):.4f} MAE={base_mae:.4f} MAPE {base_mape:.4f} sMAPE {base_smape:.4f} MAAPE {base_maape:.4f}")
-
-    # ---- Outputs ----
-    out_dir = os.path.join(".", path_, "CNN_Transformer", "Results"); ensure_dirs(out_dir)
-
-    # Plot Actual vs Model
+    tag = _sheet_tag(args.sheet)
     try:
-        N = level_pred.shape[0]
-        # The first sequence prediction aligns after lookback window
-        idx = teX_df.index[L : L + N]
-        n_feats = len(features)
-        n_cols = 2
-        n_rows = int(math.ceil(n_feats / n_cols))
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 2.6*n_rows), sharex=True)
-        if n_rows == 1 and n_cols == 1: axes = np.array([[axes]])
-        elif n_rows == 1:               axes = np.array([axes])
-        axes = axes.flatten()
-        for j, feat in enumerate(features):
-            ax = axes[j]
-            ax.plot(idx, level_true[:, j], label="Actual")
-            ax.plot(idx, level_pred[:, j], label="CNN+Transformer")
-            ax.plot(idx, baseline[:, j], label="Baseline", alpha=0.65, linestyle="--")
-            maape_j = maape(level_pred[:, j], level_true[:, j])
-            base_maape_j = maape(baseline[:, j], level_true[:, j])
-            ax.set_title(f"{feat}  MAAPE={maape_j:.3f} | Baseline MAAPE={base_maape_j:.3f}")
-            ax.grid(True, alpha=0.3)
-            if j == 0: ax.legend()
-        for k in range(j+1, len(axes)): fig.delaxes(axes[k])
-        fig.suptitle(f"Test: Actual vs CNN+Transformer (Lookback: {L})", y=0.995, fontsize=12)
-        fig.tight_layout(); fig.savefig(os.path.join(out_dir, "test_rates_forecasts.png"), dpi=150, bbox_inches="tight")
-        print("Saved: test_rates_forecasts.png")
+        _save_forecast_plot(out_dir, level_pred, level_true, baseline, teX_df, features, L, tag)
     except Exception as e:
+        import traceback
         print(f"Plotting skipped due to error: {e}")
-
-    # Excel export
-    try:
-        N = level_pred.shape[0]
-        idx = teX_df.index[L : L + N]
-        actual_df    = pd.DataFrame(level_true, index=idx, columns=features)
-        predicted_df = pd.DataFrame(level_pred, index=idx, columns=features)
-        out_xlsx = os.path.join(out_dir, "test_us_rates_predictions.xlsx")
-        with pd.ExcelWriter(out_xlsx) as writer:
-            actual_df.to_excel(writer,    sheet_name="Actual")
-            predicted_df.to_excel(writer, sheet_name="Predicted")
-        print("Saved:", out_xlsx)
-    except Exception as e:
-        print(f"Excel export skipped due to error: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
